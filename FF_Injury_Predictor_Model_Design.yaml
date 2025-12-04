@@ -1,0 +1,419 @@
+
+spec_version: "1.0"
+repo:
+  name: model-a-injury-availability
+  purpose: >
+    Standalone Python microservice that predicts weekly injury availability
+    (Active/Limited/Out) and season-level expected games missed/played for NFL
+    players (QB/RB/WR/TE) using open nflverse data. Serves calibrated
+    probabilities via a Flask API and deploys to Hugging Face Spaces.
+
+# -----------------------------
+# Runtime & Tooling
+# -----------------------------
+runtime:
+  language: python
+  python_version: "3.11"
+  framework: flask
+  server:
+    command_dev: "python -m src.serve.app"
+    command_prod: "gunicorn -w 2 -b 0.0.0.0:7860 src.serve.app:app"
+  port: 7860
+  packages:
+    # data & compute
+    - pandas==2.2.3
+    - numpy==2.1.3
+    - polars==1.17.1
+    - nflreadpy==0.1.5        # open nflverse data loader
+    # modeling
+    - scikit-learn==1.5.2
+    - lightgbm==4.6.0
+    - xgboost==2.1.2
+    - imbalanced-learn==0.12.3
+    # api & ops
+    - flask==3.0.2
+    - gunicorn==23.0.0
+    - pydantic==2.9.2
+    - python-dotenv==1.0.1
+    - structlog==24.1.0
+    - matplotlib==3.9.2
+    - requests==2.32.3
+
+# -----------------------------
+# Environment
+# -----------------------------
+env:
+  required:
+    - API_TOKEN           # Bearer token for public API
+    - TZ                  # e.g., America/New_York (controls 'Sunday noon' cutoff)
+  optional:
+    - HF_REPO_ID          # Hugging Face model repo to push artifacts (org/repo)
+  defaults:
+    TZ: "America/New_York"
+  notes: >
+    Secrets are stored in HF Space settings. For local dev, use a .env file.
+
+# -----------------------------
+# Data & Feature Engineering
+# -----------------------------
+data:
+  source: nflverse_open
+  seasons_train_window: [2019, 2020, 2021, 2022, 2023, 2024, 2025]
+  positions_allowed: ["QB", "RB", "WR", "TE"]
+  player_id_scheme: "nflverse_ids"
+  ingest:
+    module: "src/ingest/load_nflverse.py"
+    outputs:
+      injuries: "data/raw/injuries.parquet"
+      players: "data/raw/players.parquet"
+      snap_counts: "data/raw/snap_counts.parquet"
+    params:
+      seasons: "@data.seasons_train_window"
+      positions: "@data.positions_allowed"
+      cache_dir: "data/raw/cache"
+  normalize_labels:
+    module: "src/features/label_normalization.py"
+    mapping:
+      active: ["Full Practice", "Probable", "Healthy", "Cleared"]
+      limited: ["Limited", "Questionable", "Day-to-Day"]
+      out: ["Out", "Doubtful", "IR", "PUP", "Inactive"]
+    output: "data/interim/injuries_labeled.parquet"
+  features:
+    module: "src/features/build_features.py"
+    rolling_windows: [3, 5]
+    groups:
+      profile: ["age", "height", "weight", "years_exp", "position"]
+      history: ["injury_type_freq", "games_missed_prior", "fragility_score"]
+      current: ["practice_participation", "injury_designation", "snap_share_r3", "snap_share_r5"]
+      workload_spikes: ["snap_delta_vs_season", "workload_spike_flag"]
+    outputs:
+      train_matrix: "data/processed/train_matrix.parquet"
+      inference_matrix: "data/processed/inference_matrix.parquet"
+
+# -----------------------------
+# Modeling & Validation
+# -----------------------------
+modeling:
+  task: "multiclass_availability"      # Active/Limited/Out
+  learners:
+    lightgbm:
+      objective: "multiclass"
+      num_class: 3
+      params:
+        max_depth: 8
+        learning_rate: 0.05
+        num_leaves: 127
+        feature_fraction: 0.8
+        bagging_fraction: 0.8
+        min_data_in_leaf: 100
+    xgboost:
+      objective: "multi:softprob"
+      num_class: 3
+      params:
+        max_depth: 8
+        eta: 0.05
+        subsample: 0.8
+        colsample_bytree: 0.8
+  imbalance:
+    strategy: "class_weights"          # prefer weights; evaluate SMOTE safely if needed
+    smote_enabled: false
+  validation:
+    method: "TimeSeriesSplit"
+    module: "src/utils/timeseries_cv.py"
+    params:
+      n_splits: 5
+      gap: 2
+      per_position: true
+  calibration:
+    module: "src/modeling/calibrate.py"
+    preferred: "isotonic"
+    fallback: "sigmoid"
+  metrics:
+    module: "src/modeling/evaluate.py"
+    list: ["AUC", "PR_AUC", "Brier", "calibration_curve"]
+    outputs:
+      json: "artifacts/metrics_report.json"
+      plots_dir: "artifacts/plots"
+  export:
+    module: "src/modeling/export.py"
+    outputs:
+      model_bin: "artifacts/model.bin"
+      calibrator_pkl: "artifacts/calibrator.pkl"
+      feature_map: "artifacts/feature_map.json"
+      model_card: "artifacts/model_card.md"
+  versioning:
+    model_version: "A-1.0.0"
+    semver: "MAJOR.MINOR.PATCH"
+
+# -----------------------------
+# Inference Logic
+# -----------------------------
+inference:
+  thresholds:
+    tau_active: 0.50
+    tau_out: 0.50
+  season_aggregations:
+    expected_games_missed: "sum(p_out_week)"
+    expected_games_played: "weeks - expected_games_missed"
+  outputs_week:
+    - player_id
+    - position
+    - season
+    - week
+    - p_active_week
+    - p_limited_week
+    - p_out_week
+    - is_playing_this_week
+    - expected_games_missed_season
+    - model_version
+    - generated_at
+  outputs_season:
+    - player_id
+    - position
+    - season
+    - expected_games_missed_season
+    - expected_games_played_season
+    - model_version
+    - generated_at
+  options:
+    include_per_week_probs_default: false   # opt-in via query flag
+
+# -----------------------------
+# API Specification (Flask)
+# -----------------------------
+api:
+  auth:
+    type: bearer_token
+    env_key: "API_TOKEN"
+    required: true
+  rate_limit:
+    window_seconds: 60
+    max_requests_per_token: 60
+  endpoints:
+    - id: week_single
+      path: /v1/availability/{player_id}
+      method: GET
+      query:
+        - season:int:required
+        - week:int:required
+      handler: src.serve.app.get_week_availability
+      description: Weekly probabilities for a single player.
+    - id: week_batch
+      path: /v1/availability/batch
+      method: GET
+      query:
+        - player_ids:csv:required
+        - season:int:required
+        - week:int:required
+      handler: src.serve.app.get_week_availability_batch
+      description: Weekly probabilities for multiple players.
+    - id: season_single
+      path: /v1/availability/season/{player_id}
+      method: GET
+      query:
+        - season:int:required
+        - include_per_week:bool:optional=false
+      handler: src.serve.app.get_season_availability
+      description: Season-level expected games missed/played for a single player.
+    - id: season_batch
+      path: /v1/availability/season/batch
+      method: GET
+      query:
+        - player_ids:csv:required
+        - season:int:required
+        - include_per_week:bool:optional=false
+      handler: src.serve.app.get_season_availability_batch
+      description: Season-level expected games missed/played for multiple players.
+    - id: metadata
+      path: /v1/metadata/model
+      method: GET
+      handler: src.serve.app.get_model_metadata
+      description: Model version, training date, metrics summary, last snapshot times.
+    - id: healthz
+      path: /healthz
+      method: GET
+      handler: src.serve.app.healthz
+      description: Liveness/readiness check.
+    - id: admin_rebuild
+      path: /admin/rebuild
+      method: POST
+      auth: bearer_token
+      handler: src.ops.snapshots.trigger_rebuild
+      description: Secured endpoint to rebuild snapshots (Tue/Thu/Sun).
+
+# -----------------------------
+# Scheduling (Snapshots)
+# -----------------------------
+scheduling:
+  cadence:
+    - name: tuesday_morning
+      local_time: "09:00"
+      days: ["Tue"]
+      action: "POST /admin/rebuild"
+    - name: thursday_morning
+      local_time: "09:00"
+      days: ["Thu"]
+      action: "POST /admin/rebuild"
+    - name: sunday_morning_final
+      local_time: "09:00"
+      days: ["Sun"]
+      action: "POST /admin/rebuild"
+    - name: sunday_noon_cutoff
+      local_time: "12:00"
+      days: ["Sun"]
+      action: "POST /admin/rebuild"
+  runner:
+    type: external_trigger
+    options: ["GitHub Actions", "Cloud Function", "Cron hitting Space URL"]
+  notes: >
+    HF Spaces do not have native cron; use an external scheduler to call the
+    secured admin endpoint on the times above (timezone controlled by TZ).
+
+# -----------------------------
+# Repository Structure
+# -----------------------------
+structure:
+  root_files:
+    - README.md
+    - requirements.txt
+    - pyproject.toml
+    - Dockerfile
+    - .github/workflows/ci.yml
+    - configs/data_sources.yaml
+    - configs/features.yaml
+    - configs/train.yaml
+    - configs/serve.yaml
+  src_tree:
+    - src/ingest/load_nflverse.py
+    - src/ingest/schema.py
+    - src/features/build_features.py
+    - src/features/label_normalization.py
+    - src/modeling/dataset.py
+    - src/modeling/train.py
+    - src/modeling/calibrate.py
+    - src/modeling/evaluate.py
+    - src/modeling/export.py
+    - src/serve/app.py
+    - src/serve/auth.py
+    - src/serve/rate_limit.py
+    - src/serve/schema.py
+    - src/utils/timeseries_cv.py
+    - src/utils/logging.py
+    - src/utils/hf_utils.py
+    - src/ops/snapshots.py
+    - src/ops/scheduler_client.py
+  data_dirs:
+    - data/raw
+    - data/raw/cache
+    - data/interim
+    - data/processed
+  artifacts:
+    - artifacts/model.bin
+    - artifacts/calibrator.pkl
+    - artifacts/feature_map.json
+    - artifacts/model_card.md
+    - artifacts/metrics_report.json
+    - artifacts/plots
+
+# -----------------------------
+# CI/CD
+# -----------------------------
+ci:
+  provider: github_actions
+  workflow: ".github/workflows/ci.yml"
+  jobs:
+    - name: lint_and_test
+      steps:
+        - checkout
+        - setup_python: "3.11"
+        - install: "pip install -r requirements.txt"
+        - tests: "pytest -q"
+    - name: build_docker
+      steps:
+        - docker_build: "docker build -t model-a:latest ."
+        - docker_smoke: "docker run --rm -p 7860:7860 model-a:latest /bin/true"
+    - name: artifacts_check
+      steps:
+        - ensure: ["artifacts/model.bin", "artifacts/calibrator.pkl", "artifacts/feature_map.json"]
+
+# -----------------------------
+# Logging & Quality
+# -----------------------------
+logging:
+  framework: structlog
+  sinks:
+    - console
+    - file: "logs/service.log"
+  include_fields:
+    - request_id
+    - endpoint
+    - player_id
+    - season
+    - week
+    - duration_ms
+
+quality:
+  style: ruff+black
+  typing: mypy
+  security: bandit
+
+# -----------------------------
+# Tasks (for Copilot/Claude/Cursor)
+# -----------------------------
+tasks:
+  - id: T0_scaffold
+    desc: Initialize repo, create directories/files per 'structure', set up .env.
+  - id: T1_ingest
+    desc: Implement nflverse ingestion via nflreadpy and write parquet caches.
+  - id: T2_label_norm
+    desc: Normalize injury/practice labels to Active/Limited/Out; produce interim dataset.
+  - id: T3_features
+    desc: Build rolling features; export train and inference matrices.
+  - id: T4_train
+    desc: Train LightGBM multiclass with TimeSeriesSplit (gap=2); persist model.
+  - id: T5_calibrate
+    desc: Wrap model with CalibratedClassifierCV (isotonic preferred); save calibrator.
+  - id: T6_evaluate
+    desc: Compute AUC/PR_AUC/Brier/calibration curves; save report and plots.
+  - id: T7_export
+    desc: Save artifacts (model.bin, calibrator.pkl, feature_map.json) and model_card.md.
+  - id: T8_api
+    desc: Implement Flask endpoints, auth, rate limiting; return JSON schemas.
+  - id: T9_snapshots
+    desc: Implement /admin/rebuild to refresh snapshots (Tue/Thu/Sun); wire scheduler_client.
+  - id: T10_docker_ci
+    desc: Add Dockerfile; configure GH Actions; run tests and smoke checks.
+  - id: T11_docs
+    desc: Produce Unisys-style .docx design & ops guide (external to codebase).
+
+# -----------------------------
+# Acceptance Criteria
+# -----------------------------
+acceptance:
+  metrics:
+    auc_min_per_position: 0.70
+    brier_improves_after_calibration: true
+    calibration_curves_recent_weeks: "near_diagonal"
+  api_contract:
+    endpoints:
+      - /v1/availability/{player_id}
+      - /v1/availability/batch
+      - /v1/availability/season/{player_id}
+      - /v1/availability/season/batch
+      - /v1/metadata/model
+      - /healthz
+      - /admin/rebuild
+  ops:
+    snapshots_tue_thu_sun_noon: true
+    hf_spaces_port_7860: true
+
+# -----------------------------
+# Notes & Constraints
+# -----------------------------
+notes:
+  constraints:
+    - Open data only (nflverse via nflreadpy)
+    - Positions limited to QB/RB/WR/TE
+    - External factors (weather/surface/travel) postponed to later
+  deployment:
+    initial: "Hugging Face Spaces (Docker, port 7860)"
